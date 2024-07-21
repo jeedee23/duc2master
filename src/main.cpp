@@ -3,566 +3,415 @@
 #include <HardwareSerial.h>
 #include <esp_now.h>
 #include <WiFi.h>
-#include <algorithm>
 
-/* #region// Define constants */
+/* Important comments:
+INPUTS DIGITAL:
+DI17Start = pushbutton: when pushed the input is pulled to high, when not pushed input is pulled to low
+DI16Man = toggle button:when turned to ON the input is pulled to high, when turned to OFF input is pulled to low
+DI33Stop = pushbutton: when pushed the input is pulled to high, when not pushed input is pulled to low
+DI32E_Stop = emergency button: when toggled to HIGH, the ESP needs to pull all outputs high and flash the led.
+INPUTS ANALOG:
+AI35P_Water = sensor for water pressure between 0 and 5V, 6 V being 10 bar, therefore 4.8K connected from pin 39 to GND and 6.8K connected from pin 39 to output of sensor
+AI34P_vacuum = sensor set to vacuum giving a value between 0 and 3.3 volt, 0 being appr atmosphere, and 1000 being appr 0bara
+AI36P_Air = same as AI36P but for air
+AI39L_Tank = analog sensor 0 to 190 Ohm, 0 = lowest level, 190 = highest level. Pin 35 connected with 220 ohm to gnd and one side of sensor, other side of sensor connected to 3.3 V
+OUTPUTS DIGITAL:
+O2Vid = open or close Vacuum valve : LOW = CLOSED| HIGH = OPEN
+O13Ac = open or close compressed air Valve: LOW = OPEN | HIGH = CLOSED
+O19Vv_cd = direction of emptying valve : LOW = OPENING | HIGH = CLOSING
+O18Vv_On_Off = activation of emptying valve: LOW = RUNNING | HIGH = STOPPED
+O15LED = LED : LOW = ON| HIGH = OFF
+Cleaning valves: O27Clean_e1_2 = 27, O14Clean_sortie = 14, O5Clean_Ceil = 5, O25Clean_Vv = 25 : LOW = OPEN| HIGH = CLOSED
+*/
 
-#define I22Start 22             // touch button normally LOW
-#define I21Man 21               // toggle button normally LOW
-#define I33Stop 33              // touch button normally LOW
-#define I35P_Water 35           // analog sensor water pressure
-#define I32E_Stop 32            // toggle emergency button normally HIGH
-#define I34P_Vacuum 34          // analog sensor vacuum
-#define I39P_Air 39             // analog sensor compressed air
-#define I36L_Tank 36            // analog sensor level low by 200 ohm resistor
-#define O17Vid 17               // actuator valve
-#define O16Ac 16                // actuator valve compressed air
-#define O19Outlet_change_dir 19 // relays change direction outlet
-#define O18Outlet_On_Off 18     // relay start open or close outlet
-#define O23Led 23               // relay for led
-#define O25Clean_e1 25          // clean E1
-#define O26Clean_sortie 26      // clean S
-#define O27Clean_e2 27          // clean E2
-#define O5Rp 5                  // clean P
-#define O21Rd 21                // clean D
-char debugBuffer[512];
-/* #endregion */
+enum Pins {
+    DI17Start = 17, DI16Man = 16, DI33Stop = 33, DI32E_Stop = 32, AI35P_Water = 35, AI34P_Vacuum = 34, AI36P_Air = 36, AI39L_Tank = 39,
+    O2Vid = 2, O13Ac = 13, O19Vv_cd = 19, O18Vv_On_Off = 18, O15LED = 15, O27Clean_e1_2 = 27, O14Clean_sortie = 14, O5Clean_Ceil = 5, O25Clean_Vv = 25
+};
 
-// Enum definitions
-enum Clean
-{
-    e1,
-    sortie,
-    e2,
-    Rp,
-    Rd
-};
-enum Task
-{
-    Standby,
-    Manual,
-    Less_Grain,
-    More_Grain,
-    Sludge,
-    Gravel,
-    Clean
-};
-enum Action
-{
-    Vac_stopping,
-    Vac_stopping_Opening_Outlet,
-    Vac_stopping_Emptying_Tank,
-    Vac_stopping_Cleaning_Tank,
-    Vac_starting,
-    Vac_starting_Closing_Outlet,
-    Vac_starting_Cleaning_Tank,
-    Vac_starting_wait_vacuum,
-    Vac_busy,
-    Clean_busy,
-    None
-};
-enum Status
-{
-    Vac_stopped,
-    Vid_closed,
-    Vid_opened,
-    Ac_closed,
-    Ac_opened,
-    Outlet_closed,
-    Outlet_opened,
-    Clean_E1_opened,
-    Clean_E1_closed,
-    Clean_E2_opened,
-    Clean_E2_closed,
-    Clean_sortie_opened,
-    Clean_sortie_closed,
-    Led_On,
-    Led_Off,
-    Rp_opened,
-    Rp_closed,
-    Rd_opened,
-    Rd_closed
-};
-// Boolean array to store status flags
-bool statusFlags[20];
-// Function to set a status
-void setStatus(Status status, bool value)
-{
-    statusFlags[status] = value;
+enum Task { Stop = 0, Man = 1, PG = 2, PLG = 3, Bou = 4, GVrav = 5, Clean = 6 };
+enum State { none = 0, started = 1, busy = 2, ended = 3, error = 4 };
+
+// State variables
+int stat_OpenVv = none;
+int stat_CloseVv = none;
+int stat_OpenAc = none;
+int stat_CloseAc = none;
+int stat_Clean_Vv = none;
+int stat_Check_Ac = none;
+int stat_Check_Water = none;
+int stat_Check_Vid = none;
+int Act_Vacuum = none;
+int Act_Stop = none;
+
+// Timers
+unsigned long Timer_Vv = 0;
+unsigned long Timer_Ac = 0;
+unsigned long Timer_Clean_Vv = 0;
+unsigned long Timer_Check_Ac = 0;
+unsigned long Timer_Check_Water = 0;
+unsigned long Timer_Check_Vid = 0;
+
+// Timeouts
+const unsigned long timeout_Vv = 5000;        // 5 seconds
+const unsigned long timeout_Ac = 3000;        // 3 seconds
+const unsigned long Timeout_Clean_Vv = 3000;  // 3 seconds
+const unsigned long Timeout_Check_Ac = 2000;  // 2 seconds
+const unsigned long Timeout_Check_Water = 2000;  // 2 seconds
+const unsigned long Timeout_Check_Vid = 7000;  // 7 seconds
+
+// Sensor values
+int Val_Vacuum = 0;
+int Val_Level = 0;
+int Val_Water = 0;
+int Val_Air = 0;
+
+// HMI message
+String Hmi_msg = "";
+
+// Mac address of the slave
+uint8_t slaveAddress[] = {0x0C, 0xB8, 0x15, 0xF4, 0x5D, 0x34};
+
+// Data structure for receiving data
+typedef struct struct_message {
+    char command[32];
+    // Add more fields as needed
+} struct_message;
+
+struct_message myData;
+
+// Callback when data is sent
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    Serial.print("\r\nLast Packet Send Status: ");
+    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
 }
-// Function to get a status
-bool getStatus(Status status)
-{
-    return statusFlags[status];
+
+// Callback when data is received
+void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+    memcpy(&myData, incomingData, sizeof(myData));
+    Serial.print("Bytes received: ");
+    Serial.println(len);
+    Serial.println("Received command: " + String(myData.command));
+
+    // Handle received command
+    if (strcmp(myData.command, "start") == 0) {
+        // Start operation
+        Serial.println("Starting operation...");
+    } else if (strcmp(myData.command, "stop") == 0) {
+        // Stop operation
+        Serial.println("Stopping operation...");
+    }
+    // Add more command handlers as needed
 }
-// Min/Max value parameters
-enum Min_Max
-{
-    Vac_starting_Max_Vacuum,
-    Vac_starting_Pressure_Air,
-    Vac_starting_Pressure_Water,
-    Vac_busy_Max_Vacuum,
-    Vac_busy_Max_Level,
-    Vac_busy_Max_Time
-};
-/* #region a bunch of other variables and settings */
-String receivedData = "empty";
-String debugString = "empty";
-// Define task states
-Task currentTask = Standby;
-// Define action states
-Action currentAction = None;
 
-// Maximum times for actions (in milliseconds)
-#define MAX_TIME_VAC_stopping 30000
-#define MAX_TIME_VAC_STARTING 60000
+void setup() {
+    Serial.begin(115200);
+    WiFi.mode(WIFI_STA);
 
-// Define variables
-int Simulation_On = 0;
+    // Init ESP-NOW
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
 
-// Data reading
-int P_Vacuum = 0; // vacuum
-int L_Tank = 0;   // level
-int P_Air = 0;    // compressed air
-int P_Water = 0;  // water
-int E_Stop = 0;   // emergency stop coming from I32E_Stop
-int Start = 0;    // Start button or data from HMI
-int Stop = 0;     // Normal stop, no emergency coming from I33Stop or inside code (to simplify code)
-int Man = 0;      // Manual mode coming from I21Man
+    // Register callbacks
+    esp_now_register_send_cb(onDataSent);
+    esp_now_register_recv_cb(onDataRecv);
 
-unsigned long Time_Empty = 0;
-unsigned long previousMillis = 0;
-unsigned long previousBlinkMillis = 0;
-int blinkCount = 0;
-int totalBlinks = 0;
-int timesToBlink = 0;
-float timeBetweenBlink = 0;
-float durationBlink = 0;
+    // Add slave as peer
+    esp_now_peer_info_t peerInfo;
+    memcpy(peerInfo.peer_addr, slaveAddress, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
 
-String Hmi_msg = "This is the start message";
-String Hmi_P_Vacuum = "0.00";
-String Hmi_P_Water = "0.00";
-String Hmi_P_Air = "0.00";
-String Hmi_Start = "0";
-String Hmi_man = "0";
-String Hmi_stop = "1";
-String Hmi_data = "";
-String outputString = "";
-unsigned long tim;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("Failed to add peer");
+        return;
+    }
 
-unsigned long actionTimers[14] = {0}; // To track start time of each action
+    // Initialize the pins
+    pinMode(DI17Start, INPUT_PULLDOWN);
+    pinMode(DI16Man, INPUT_PULLDOWN);
+    pinMode(DI33Stop, INPUT_PULLDOWN);
+    pinMode(DI32E_Stop, INPUT_PULLDOWN);
+    pinMode(AI35P_Water, INPUT);
+    pinMode(AI34P_Vacuum, INPUT);
+    pinMode(AI36P_Air, INPUT);
+    pinMode(AI39L_Tank, INPUT);
+    pinMode(O2Vid, OUTPUT);
+    pinMode(O13Ac, OUTPUT);
+    pinMode(O19Vv_cd, OUTPUT);
+    pinMode(O18Vv_On_Off, OUTPUT);
+    pinMode(O15LED, OUTPUT);
+    pinMode(O27Clean_e1_2, OUTPUT);
+    pinMode(O14Clean_sortie, OUTPUT);
+    pinMode(O5Clean_Ceil, OUTPUT);
+    pinMode(O25Clean_Vv, OUTPUT);
 
-bool standby = true;          // system stand-by
-bool stopping = false;        // loop intercepts stopping Priority 1
-bool emptying = false;        // void stopping intercepts emptying, so this is a sub-priority 1.1
-bool Vacuum_starting = false; // loop intercepts Vac_starting 2
-bool Man_started = false;     // loop intercepts if Man_started Priority 2
+    digitalWrite(O2Vid, HIGH);
+    digitalWrite(O13Ac, HIGH);
+    digitalWrite(O19Vv_cd, HIGH);
+    digitalWrite(O18Vv_On_Off, HIGH);
+    digitalWrite(O27Clean_e1_2, HIGH);
+    digitalWrite(O14Clean_sortie, HIGH);
+    digitalWrite(O5Clean_Ceil, HIGH);
+    digitalWrite(O25Clean_Vv, HIGH);
+    digitalWrite(O15LED, LOW);
+}
 
-uint8_t masterAddress[] = {0x30, 0xC6, 0xF7, 0x30, 0x1C, 0x0C}; // test board = 30:C6:F7:30:1C:0C on site : {0xA4, 0xCF, 0x12, 0x9A, 0xCC, 0x68}
-uint8_t slaveAddress[] = {0x0C, 0xB8, 0x15, 0xF4, 0xC3, 0x48};  // 0C:B8:15:F4:C3:48
-bool responseReceived = false;
+void Open_Vv() {
+    Clean_Vv();
+    if (stat_OpenVv == busy && (millis() - Timer_Vv) > timeout_Vv) {
+        digitalWrite(O19Vv_cd, HIGH);
+        digitalWrite(O18Vv_On_Off, HIGH);
+        stat_OpenVv = ended;
+        Timer_Vv = 0;
+    }
+    if (stat_OpenVv == none) {
+        Timer_Vv = millis();
+        digitalWrite(O18Vv_On_Off, HIGH);
+        digitalWrite(O18Vv_On_Off, LOW);
+        stat_OpenVv = busy;
+    }
+}
 
-bool actions[14] = {false}; // To track which actions are active
-unsigned long maxTimes[14] = {
-    0,                     // Dummy value for index 0
-    MAX_TIME_VAC_stopping, // Vac_stopping
-    10000,                 // Vac_stopping_Opening_Outlet
-    20000,                 // Vac_stopping_Emptying_Tank
-    15000,                 // Vac_stopping_Cleaning_Tank
-    MAX_TIME_VAC_STARTING, // Vac_starting
-    5000,                  // Vac_starting_Closing_Outlet
-    10000,                 // Vac_starting_Cleaning
-    20000,                 // Vac_starting_Max_Vacuum
-    10000,                 // Vac_starting_Pressure_Air
-    10000,                 // Vac_starting_Pressure_Water
-    20000,                 // Vac_busy_Max_Vacuum
-    15000,                 // Vac_busy_Max_Level
-    30000                  // Vac_busy_Max_Time
-};
+void Close_Vv() {
+    Clean_Vv();
+    if (stat_CloseVv == busy && (millis() - Timer_Vv) > timeout_Vv) {
+        digitalWrite(O19Vv_cd, HIGH);
+        digitalWrite(O18Vv_On_Off, HIGH);
+        stat_CloseVv = ended;
+        Timer_Vv = 0;
+    }
+    if (stat_CloseVv == none) {
+        Timer_Vv = millis();
+        digitalWrite(O18Vv_On_Off, HIGH);
+        digitalWrite(O18Vv_On_Off, LOW);
+        stat_CloseVv = busy;
+    }
+}
 
-// Air and Water pressure monitoring
-const unsigned long airTimeout = 30000;   // Timeout duration for air pressure below threshold
-const unsigned long waterTimeout = 30000; // Timeout duration for water pressure below threshold
+void Close_Ac() {
+    if (stat_CloseAc == busy && (millis() - Timer_Ac) > timeout_Ac) {
+        digitalWrite(O13Ac, HIGH);
+        stat_CloseAc = ended;
+        Timer_Ac = 0;
+    }
+    if (stat_CloseAc == none) {
+        Timer_Ac = millis();
+        digitalWrite(O13Ac, HIGH);
+        stat_CloseAc = busy;
+    }
+}
 
-unsigned long airPressureTimer = 0;
-unsigned long waterPressureTimer = 0;
-/* #endregion */
-void StopAll()
-{
-    if (!standby)
-    {
-        actionTimers[Vac_stopping] = millis();
-        if (Ac_opened && (millis() - actionTimers[Vac_stopping]) > 1000)
-        {
-            digitalWrite(O16Ac, HIGH);
-            setStatus(Ac_closed, true);
-            setStatus(Ac_opened, false);
+void Open_Ac() {
+    if (stat_OpenAc == busy && (millis() - Timer_Ac) > timeout_Ac) {
+        digitalWrite(O13Ac, LOW);
+        stat_OpenAc = ended;
+        Timer_Ac = 0;
+    }
+    if (stat_OpenAc == none) {
+        Timer_Ac = millis();
+        digitalWrite(O13Ac, LOW);
+        stat_OpenAc = busy;
+    }
+}
+
+// Clean all open all valves
+void Clean_All() {
+    digitalWrite(O14Clean_sortie, LOW);
+    digitalWrite(O27Clean_e1_2, LOW);
+    digitalWrite(O25Clean_Vv, LOW);
+    digitalWrite(O5Clean_Ceil, LOW);
+}
+
+void Clean_Vv() {
+    if (stat_Clean_Vv == busy && (millis() - Timer_Clean_Vv) > Timeout_Clean_Vv) {
+        digitalWrite(O14Clean_sortie, HIGH);
+        stat_Clean_Vv = ended;
+        Timer_Clean_Vv = 0;
+    }
+    if (stat_Clean_Vv == none) {
+        Timer_Clean_Vv = millis();
+        digitalWrite(O14Clean_sortie, LOW);
+        stat_Clean_Vv = busy;
+    }
+}
+
+void Stop_Clean() {
+    digitalWrite(O14Clean_sortie, HIGH);
+    digitalWrite(O27Clean_e1_2, HIGH);
+    digitalWrite(O25Clean_Vv, HIGH);
+    digitalWrite(O5Clean_Ceil, HIGH);
+}
+
+void Check_Ac() {
+    if (stat_Check_Ac == busy && (millis() - Timer_Check_Ac) > Timeout_Check_Ac) {
+        if (Val_Air > 600 && Val_Air < 700) {
+            stat_Check_Ac = ended;
+        } else {
+            stat_Check_Ac = error;
+        }
+        Timer_Check_Ac = 0;
+    }
+    if (stat_Check_Ac == none) {
+        Timer_Check_Ac = millis();
+        stat_Check_Ac = busy;
+    }
+}
+
+void Check_Water() {
+    if (stat_Check_Water == busy && (millis() - Timer_Check_Water) > Timeout_Check_Water) {
+        if (Val_Water > 200) {
+            stat_Check_Water = ended;
+        } else {
+            stat_Check_Water = error;
+        }
+        Timer_Check_Water = 0;
+    }
+    if (stat_Check_Water == none) {
+        Timer_Check_Water = millis();
+        stat_Check_Water = busy;
+    }
+}
+
+void Check_Vid() {
+    if (stat_Check_Vid == busy && (millis() - Timer_Check_Vid) > Timeout_Check_Vid) {
+        if (Val_Vacuum >= 600) {
+            stat_Check_Vid = ended;
+        } else {
+            stat_Check_Vid = error;
+        }
+        Timer_Check_Vid = 0;
+    }
+    if (stat_Check_Vid == none) {
+        Timer_Check_Vid = millis();
+        stat_Check_Vid = busy;
+    }
+}
+
+void Start_Vac() {
+    if (Act_Vacuum == none) {
+        if ((Timer_Clean_Vv == 0 && stat_Clean_Vv == ended) || stat_Clean_Vv == none) {
+            Clean_Vv();
+        }
+        if ((Timer_Vv == 0 && stat_CloseVv == ended) || stat_CloseVv == none) {
+            Close_Vv();
         }
     }
+}
 
-    digitalWrite(O17Vid, HIGH);
-    digitalWrite(O19Outlet_change_dir, LOW); // clapet open
-    digitalWrite(O18Outlet_On_Off, LOW);
-    digitalWrite(O23Led, LOW);
-    digitalWrite(O25Clean_e1, HIGH);
-    digitalWrite(O26Clean_sortie, HIGH);
-    digitalWrite(O27Clean_e2, HIGH);
-    digitalWrite(O5Rp, HIGH);
-    digitalWrite(O21Rd, HIGH);
-    for (int i = 0; i < 14; i++)
-    {
-        actionTimers[i] = 0;
+void Stop_All() {
+    if (Act_Stop == none || Act_Stop == busy) {
+        if (stat_CloseAc != ended) {
+            Close_Ac();
+        }
+        if (stat_Check_Ac != ended && stat_CloseAc == ended) {
+            Check_Ac();
+        }
+        if (stat_Check_Water != ended && stat_Check_Ac == ended) {
+            Check_Water();
+        }
+        if (stat_Check_Vid != ended && stat_Check_Ac == ended && stat_Check_Water == ended) {
+            Check_Vid();
+        }
+        if (stat_OpenVv != ended && stat_Check_Ac == ended && stat_Check_Water == ended && stat_Check_Vid == ended) {
+            Open_Vv();
+        }
+        if (stat_OpenVv == ended) {
+            Act_Stop = ended;
+            Hmi_msg = "STOPPED";
+            delay(30);
+            Act_Vacuum = none;
+        }
     }
-    Hmi_msg = "STOPPED";
-    currentTask = Standby;
-    delay(30);
-    Vacuum_starting = 0;
-    Man_started = 0;
-    standby = true;
 }
-void CloseOutlet()
-{
-    digitalWrite(O19Outlet_change_dir, LOW);
-    digitalWrite(O18Outlet_On_Off, LOW);
+
+void Empty_between() {
+    // Placeholder function
 }
-void OpenOutlet()
-{
-    digitalWrite(O19Outlet_change_dir, HIGH);
-    digitalWrite(O18Outlet_On_Off, LOW);
-}
-void CleanEntry() {}
-void OpenVid() {}
-void CloseVid()
-{
-    digitalWrite(O17Vid, LOW);
-    setStatus(Vid_closed, true);
-    setStatus(Vid_opened, false);
-}
-void Openac()
-{
-    digitalWrite(O16Ac, LOW);
-    setStatus(Ac_closed, false);
-    setStatus(Ac_opened, true);
-}
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
-{
-    // Serial.print("\r\nLast Packet Send Status: ");
-    // Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
-}
-void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
-{
-    // Serial.print("Bytes received: ");
-    // Serial.println(len);
-    responseReceived = true; // Set the response flag to true
-}
-int median(int *arr, int n)
-{
-    std::sort(arr, arr + n); // Using standard sort function
-    return arr[n / 2];
-}
-int mostFrequent(int *arr, int n)
-{
-    std::sort(arr, arr + n); // Using standard sort function
+
+int mostFrequent(int *arr, int n) {
+    std::sort(arr, arr + n);
     int maxCount = 1, res = arr[0], currCount = 1;
-    for (int i = 1; i < n; i++)
-    {
-        if (arr[i] == arr[i - 1])
-        {
+    for (int i = 1; i < n; i++) {
+        if (arr[i] == arr[i - 1]) {
             currCount++;
-        }
-        else
-        {
-            if (currCount > maxCount)
-            {
+        } else {
+            if (currCount > maxCount) {
                 maxCount = currCount;
                 res = arr[i - 1];
             }
             currCount = 1;
         }
     }
-    if (currCount > maxCount)
-    {
+    if (currCount > maxCount) {
         maxCount = currCount;
         res = arr[n - 1];
     }
     return res;
 }
-void StopBlink()
-{
-    // Stop blink functionality
-}
-void blinkf(int aant, int draan, int druit, int wacht)
-{
-    druit = draan;
-    delay(wacht);
-}
-void resetInputsToDefault() {
-    Start = 0;
-    Man = 0;
-    Stop = 0;
-    P_Water = 0;
-    E_Stop = 1;
-    P_Vacuum = 0;
-    P_Air = 0;
-    L_Tank = 4095; // Assuming this is the default for the analog sensor
-}
-unsigned long lastDebugSendTime = 0;
-const unsigned long debugSendInterval = 500; // Interval between debug messages in milliseconds
-int debugSendCount = 0;
-const int maxDebugSendCount = 100; // Maximum number of debug messages to send
-bool debugStringReady;
-String debugStringToSend;
-void sendDebugString() {
-    unsigned long currentTime = millis();
 
-    if (debugSendCount < maxDebugSendCount && currentTime - lastDebugSendTime >= debugSendInterval) {
-        if (debugStringReady) {
-            esp_err_t result = esp_now_send(slaveAddress, (uint8_t *)debugStringToSend.c_str(), debugStringToSend.length());
-            if (result == ESP_OK) {
-                Serial.println(debugStringToSend);
-            } else {
-                Serial.println("Error sending debug string");
-            }
-            debugStringReady = false;
-            lastDebugSendTime = currentTime;
-            debugSendCount++;
-        }
-    }
+int processDigitalReading(int readings[], int numReadings) {
+    return mostFrequent(readings, numReadings);
 }
-void readall() {
+
+int median(int *arr, int n) {
+    std::sort(arr, arr + n);
+    return arr[n / 2];
+}
+
+void processRealSensorData() {
     const int numReadings = 5;
     const int delayInterval = 10;
-    char serialBuffer[512]; // Increased buffer size to 512
-    bool dataReceived = false;
-    unsigned long startTime = millis();
-    // E-stop override
-    E_Stop = 1;
+    int Val_StartReadings[numReadings];
+    int Val_ManReadings[numReadings];
+    int Val_StopReadings[numReadings];
+    int Val_VacuumReadings[numReadings];
+    int Val_WaterReadings[numReadings];
+    int Val_AirReadings[numReadings];
+    int Val_EstopReadings[numReadings];
+    int Val_LevelReadings[numReadings];
 
-    // Check for incoming serial data within a 100ms window
-    while (millis() - startTime < 100) {
-        if (Serial.available() > 0) {
-            Serial.readBytesUntil('\n', serialBuffer, sizeof(serialBuffer) - 1);
-            dataReceived = true;
-            break;
-        }
+    for (int i = 0; i < numReadings; i++) {
+        Val_StartReadings[i] = digitalRead(DI17Start);
+        Val_ManReadings[i] = digitalRead(DI16Man);
+        Val_StopReadings[i] = digitalRead(DI33Stop);
+        Val_VacuumReadings[i] = analogRead(AI34P_Vacuum);
+        Val_WaterReadings[i] = analogRead(AI35P_Water);
+        Val_AirReadings[i] = analogRead(AI36P_Air);
+        Val_LevelReadings[i] = analogRead(AI39L_Tank);
+        Val_EstopReadings[i] = digitalRead(DI32E_Stop);
+
+        delay(delayInterval);
     }
 
-    // Process received data if available
-    if (dataReceived) {
-        String receivedData = String(serialBuffer);
-        if (receivedData == "REBOOT") {
-            ESP.restart();
-        }
-        if (receivedData.startsWith("||") && receivedData.endsWith("||")) {
-            receivedData = receivedData.substring(2, receivedData.length() - 4);
-            debugStringToSend = "||Debugbuffer:|" + receivedData + "||";
-            debugStringReady = true;
-        }
-
-        // Process the rest of the received data
-        int numKeyValuePairs = 0;
-        String keyValuePairs[20];
-        int startIndex = 0;
-        int endIndex = receivedData.indexOf('|');
-
-        while (endIndex != -1) {
-            keyValuePairs[numKeyValuePairs++] = receivedData.substring(startIndex, endIndex);
-            startIndex = endIndex + 1;
-            endIndex = receivedData.indexOf('|', startIndex);
-        }
-
-        for (int i = 0; i < numKeyValuePairs; i++) {
-            int colonIndex = keyValuePairs[i].indexOf(':');
-            if (colonIndex != -1) {
-                String key = keyValuePairs[i].substring(0, colonIndex);
-                String value = keyValuePairs[i].substring(colonIndex + 1);
-
-                if (key == "Simulation_On") {
-                    Simulation_On = value.toInt();
-                } else if (key == "I22Start") {
-                    Start = value.toInt();
-                } else if (key == "I21Man") {
-                    Man = value.toInt();
-                } else if (key == "I33Stop") {
-                    Stop = value.toInt();
-                } else if (key == "I35P_Water") {
-                    P_Water = value.toInt();
-                } else if (key == "I32E_Stop") {
-                    E_Stop = value.toInt();
-                } else if (key == "I34P_Vacuum") {
-                    P_Vacuum = value.toInt();
-                } else if (key == "I39P_Air") {
-                    P_Air = value.toInt();
-                } else if (key == "I36L_Tank") {
-                    L_Tank = value.toInt();
-                }
-            }
-        }
-    }
-    E_Stop = 1;
-    if (!Simulation_On) {
-        // Actual reading from sensors
-        int startReadings[numReadings];
-        int manReadings[numReadings];
-        int stopReadings[numReadings];
-        int P_VacuumReadings[numReadings];
-        int P_WaterReadings[numReadings];
-        int P_AirReadings[numReadings];
-        int E_StopReadings[numReadings];
-        int L_TankReadings[numReadings];
-
-        for (int i = 0; i < numReadings; i++) {
-            startReadings[i] = digitalRead(I22Start);
-            manReadings[i] = digitalRead(I21Man);
-            stopReadings[i] = digitalRead(I33Stop);
-            P_VacuumReadings[i] = analogRead(I34P_Vacuum);
-            P_WaterReadings[i] = analogRead(I35P_Water);
-            P_AirReadings[i] = analogRead(I39P_Air);
-            L_TankReadings[i] = analogRead(I36L_Tank);
-            E_StopReadings[i] = digitalRead(I32E_Stop);
-            delay(delayInterval);
-        }
-
-        Start = mostFrequent(startReadings, numReadings);
-        Man = mostFrequent(manReadings, numReadings);
-        Stop = mostFrequent(stopReadings, numReadings);
-        P_Vacuum = median(P_VacuumReadings, numReadings);
-        P_Water = median(P_WaterReadings, numReadings);
-        P_Air = median(P_AirReadings, numReadings);
-        E_Stop = mostFrequent(E_StopReadings, numReadings);
-        L_Tank = median(L_TankReadings, numReadings);
-    } else {
-        // Simulation mode handling
-        /* if (Start == 1) {
-            Start = 0; // Touch button, goes LOW after HIGH
-        }
-        if (Stop == 1) {
-            Stop = 0; // Touch button, goes LOW after HIGH
-        } */
-        if (E_Stop == 0 || E_Stop == 1) {
-            E_Stop = 1; // Emergency button stays LOW
-            // StopAll(); // Invoke emergency interrupt
-        }
-    }
-
-    // Update states based on outputs
-    if (digitalRead(O17Vid) == LOW) {
-        setStatus(Vid_closed, true);
-        setStatus(Vid_opened, false);
-    } else {
-        setStatus(Vid_closed, false);
-        setStatus(Vid_opened, true);
-    }
-
-    if (digitalRead(O16Ac) == HIGH) {
-        setStatus(Ac_closed, true);
-        setStatus(Ac_opened, false);
-    } else {
-        setStatus(Ac_closed, false);
-        setStatus(Ac_opened, true);
-    }
-
-    if ((digitalRead(O18Outlet_On_Off) == LOW) && (digitalRead(O19Outlet_change_dir) == LOW)) {
-        setStatus(Outlet_closed, true);
-        setStatus(Outlet_opened, false);
-    } else if ((digitalRead(O18Outlet_On_Off) == LOW) && (digitalRead(O19Outlet_change_dir) == HIGH)) {
-        setStatus(Outlet_closed, false);
-        setStatus(Outlet_opened, true);
-    }
-
-    if (digitalRead(O25Clean_e1) == HIGH) {
-        setStatus(Clean_E1_closed, true);
-        setStatus(Clean_E1_opened, false);
-    } else {
-        setStatus(Clean_E1_closed, false);
-        setStatus(Clean_E1_opened, true);
-    }
-
-    if (digitalRead(O27Clean_e2) == HIGH) {
-        setStatus(Clean_E2_closed, true);
-        setStatus(Clean_E2_opened, false);
-    } else {
-        setStatus(Clean_E2_closed, false);
-        setStatus(Clean_E2_opened, true);
-    }
-
-    if (digitalRead(O26Clean_sortie) == HIGH) {
-        setStatus(Clean_sortie_closed, true);
-        setStatus(Clean_sortie_opened, false);
-    } else {
-        setStatus(Clean_sortie_closed, false);
-        setStatus(Clean_sortie_opened, true);
-    }
-
-    if (digitalRead(O23Led) == HIGH) {
-        setStatus(Led_Off, true);
-        setStatus(Led_On, false);
-    } else {
-        setStatus(Led_Off, false);
-        setStatus(Led_On, true);
-    }
-
-    if (digitalRead(O5Rp) == HIGH) {
-        setStatus(Rp_closed, true);
-        setStatus(Rp_opened, false);
-    } else {
-        setStatus(Rp_closed, false);
-        setStatus(Rp_opened, true);
-    }
-
-    if (digitalRead(O21Rd) == HIGH) {
-        setStatus(Rd_closed, true);
-        setStatus(Rd_opened, false);
-    } else {
-        setStatus(Rd_closed, false);
-        setStatus(Rd_opened, true);
-    }
-
-    // Build the output string
-    outputString = "||Simulation_On:" + String(Simulation_On ? 1 : 0) + "|";
-    outputString += "I22Start:" + String(Start) + "|";
-    outputString += "I21Man:" + String(Man) + "|";
-    outputString += "I33Stop:" + String(Stop) + "|";
-    outputString += "I35P_Water:" + String(P_Water) + "|";
-    outputString += "I32E_Stop:" + String(E_Stop) + "|";
-    outputString += "I34P_Vacuum:" + String(P_Vacuum) + "|";
-    outputString += "I39P_Air:" + String(P_Air) + "|";
-    outputString += "I36L_Tank:" + String(L_Tank) + "|";
-    outputString += "O17Vid:" + String(digitalRead(O17Vid) ? "OPEN" : "CLOSED") + "|";
-    outputString += "O16Ac:" + String(digitalRead(O16Ac) ? "CLOSED" : "OPEN") + "|";
-    outputString += "O19Outlet_change_dir:" + String(digitalRead(O19Outlet_change_dir) ? "CLOSING_DIR" : "OPENING_DIR") + "|";
-    outputString += "O18Outlet_On_Off:" + String(digitalRead(O18Outlet_On_Off) ? "OFF" : "ON") + "|";
-    outputString += "O23Led:" + String(digitalRead(O23Led) ? "OFF" : "ON") + "|";
-    outputString += "O25Clean_e1:" + String(digitalRead(O25Clean_e1) ? "CLOSED" : "OPEN") + "|";
-    outputString += "O26Clean_sortie:" + String(digitalRead(O26Clean_sortie) ? "CLOSED" : "OPEN") + "|";
-    outputString += "O27Clean_e2:" + String(digitalRead(O27Clean_e2) ? "CLOSED" : "OPEN") + "|";
-    outputString += "O5Rp:" + String(digitalRead(O5Rp) ? "CLOSED" : "OPEN") + "|";
-    outputString += "O21Rd:" + String(digitalRead(O21Rd) ? "CLOSED" : "OPEN") + "|";
-    outputString += Hmi_msg + "|";
-    outputString += "RequestUpdate||";
-
-    Serial.println(outputString);
-
-    // Delay to ensure PC processes the output string
-    delay(100);
-
-    // Now send the debug string
-    //sendDebugString();
+    Val_Start = processDigitalReading(Val_StartReadings, numReadings);
+    Val_Man = processDigitalReading(Val_ManReadings, numReadings);
+    Val_Stop = processDigitalReading(Val_StopReadings, numReadings);
+    Val_Estop = processDigitalReading(Val_EstopReadings, numReadings);
+    Val_Vacuum = median(Val_VacuumReadings, numReadings);
+    Val_Water = median(Val_WaterReadings, numReadings);
+    Val_Air = median(Val_AirReadings, numReadings);
+    Val_Level = median(Val_LevelReadings, numReadings);
 }
-void sendData() {
-    // Print data to be sent for debugging
-    Hmi_data = outputString;
 
-    // Ensure data length does not exceed ESP-NOW limits
-    const size_t maxDataLength = 250; // Maximum payload size for ESP-NOW
+void sendData() {
+    if (PreviousOutputString != OutputString) {
+        PreviousOutputString = OutputString;
+        Serial.println(OutputString);
+    }
+    Hmi_data = OutputString;
+
+    const size_t maxDataLength = 250;
     if (Hmi_data.length() > maxDataLength) {
-        // Split the data into smaller chunks
         size_t pos = 0;
         while (pos < Hmi_data.length()) {
             String chunk = Hmi_data.substring(pos, pos + maxDataLength);
             esp_err_t result = esp_now_send(slaveAddress, (uint8_t *)chunk.c_str(), chunk.length());
             if (result != ESP_OK) {
                 Serial.printf("Error sending ESP-NOW data chunk: %d\n", result);
+                Hmi_connected = false;
             }
             pos += maxDataLength;
         }
@@ -570,496 +419,62 @@ void sendData() {
         esp_err_t result = esp_now_send(slaveAddress, (uint8_t *)Hmi_data.c_str(), Hmi_data.length());
         if (result != ESP_OK) {
             Serial.printf("Error sending ESP-NOW data: %d\n", result);
+            Hmi_connected = false;
         }
     }
 
-    // Wait for response with timeout
-    responseReceived = false; // Reset the response flag
+    responseReceived = false;
     unsigned long startTime = millis();
-    unsigned long timeout = 5000; // 5 seconds timeout
+    unsigned long timeout = 500;
 
     while (!responseReceived && (millis() - startTime) < timeout) {
-        // Do nothing, just wait for the response or timeout
-        delay(10); // Small delay to avoid busy waiting
+        delay(1);
     }
 
     if (!responseReceived) {
-        // If no response is received within the timeout period, invoke StopAll
-        StopAll();
-    }
-    delay(10);
-}
-
-void CleanEntr()
-{
-    digitalWrite(O25Clean_e1, LOW);
-    digitalWrite(O27Clean_e2, LOW);
-}
-void Stopclean()
-{
-    digitalWrite(O25Clean_e1, HIGH);
-    digitalWrite(O27Clean_e2, HIGH);
-    digitalWrite(O26Clean_sortie, HIGH);
-    digitalWrite(O21Rd, HIGH);
-    digitalWrite(O5Rp, HIGH);
-}
-void StopNormal()
-{
-    Vacuum_starting = false;
-    Man_started = false;
-    stopping = true;
-    actionTimers[Vac_stopping_Emptying_Tank] = millis();
-    stopping = true;
-    if (L_Tank <= 20)
-    {
-        Time_Empty = 17000;
-    }
-    if (L_Tank >= 200)
-    {
-        Time_Empty = 60000;
-    }
-    if (L_Tank > 20 && L_Tank < 200)
-    {
-        Time_Empty = 60000 * (L_Tank / 200);
-    }
-    digitalWrite(O27Clean_e2, LOW);
-    digitalWrite(O25Clean_e1, LOW);
-
-    digitalWrite(O16Ac, HIGH);
-    digitalWrite(O17Vid, HIGH);
-    digitalWrite(O19Outlet_change_dir, LOW); // clapet open
-    digitalWrite(O18Outlet_On_Off, LOW);
-    digitalWrite(O23Led, LOW);
-    digitalWrite(O25Clean_e1, HIGH);
-    digitalWrite(O26Clean_sortie, HIGH);
-    digitalWrite(O27Clean_e2, HIGH);
-    digitalWrite(O5Rp, HIGH);
-    digitalWrite(O21Rd, HIGH);
-    delay(1000);
-}
-void IRAM_ATTR normalStop()
-{
-    StopAll(); // Stop all operations
-}
-void IRAM_ATTR emergencyStop()
-{
-    StopAll(); // Stop all operations
-}
-void handleVac_stopping_Opening_Outlet()
-{
-    Hmi_msg = "Vac_stopping:Opening_Outlet";
-    // Handle Vac_stopping_Opening_Outlet logic
-}
-void handleVac_stopping_Emptying_Tank()
-{
-    Hmi_msg = "Vac_stopping:Emptying_Tank";
-    // Handle Vac_stopping_Emptying_Tank logic
-}
-void handleVac_stopping_Cleaning_Tank()
-{
-    Hmi_msg = "Vac_stopping:Cleaning_Tank";
-    // Handle Vac_stopping_Cleaning_Tank logic
-}
-void handleVac_starting_Cleaning_Tank()
-{
-    Hmi_msg = "Vac_starting:Cleaning_Tank";
-    // Handle Vac_starting_Cleaning_Tank logic
-}
-void handleVac_busy()
-{
-    Hmi_msg = "Vac_busy";
-    // Handle Vac_busy logic
-}
-void handleClean_busy()
-{
-    Hmi_msg = "Clean_busy";
-    // Handle Clean_busy logic
-}
-void handleVac_stopping()
-{
-    Hmi_msg = "Vac_stopping";
-    if (actions[Vac_stopping_Opening_Outlet])
-    {
-        if (millis() - actionTimers[Vac_stopping_Opening_Outlet] > maxTimes[Vac_stopping_Opening_Outlet])
-        {
-            // Complete action and move to next
-            actions[Vac_stopping_Opening_Outlet] = false;
-            actions[Vac_stopping_Emptying_Tank] = true;
-            actionTimers[Vac_stopping_Emptying_Tank] = millis();
-        }
-        handleVac_stopping_Opening_Outlet();
-    }
-    else if (actions[Vac_stopping_Emptying_Tank])
-    {
-        if (millis() - actionTimers[Vac_stopping_Emptying_Tank] > maxTimes[Vac_stopping_Emptying_Tank])
-        {
-            // Complete action and move to next
-            actions[Vac_stopping_Emptying_Tank] = false;
-            actions[Vac_stopping_Cleaning_Tank] = true;
-            actionTimers[Vac_stopping_Cleaning_Tank] = millis();
-        }
-        handleVac_stopping_Emptying_Tank();
-    }
-    else if (actions[Vac_stopping_Cleaning_Tank])
-    {
-        if (millis() - actionTimers[Vac_stopping_Cleaning_Tank] > maxTimes[Vac_stopping_Cleaning_Tank])
-        {
-            // Complete action and move to next
-            actions[Vac_stopping_Cleaning_Tank] = false;
-        }
-        handleVac_stopping_Cleaning_Tank();
-    }
-}
-void handleVac_starting()
-{
-    Hmi_msg = "Vac_starting";
-    if (getStatus(Outlet_closed) == false)
-    {
-        currentAction = Vac_starting_Closing_Outlet;
-        actionTimers[Vac_starting_Closing_Outlet] = millis();
-        maxTimes[Vac_starting_Closing_Outlet] = 2000;
-        return;
-    }
-}
-void handleVac_starting_Closing_Outlet()
-{
-    Hmi_msg = "Vac_starting:Closing_Outlet";
-    digitalWrite(O25Clean_e1, LOW);
-    digitalWrite(O26Clean_sortie, LOW);
-    digitalWrite(O27Clean_e2, LOW);
-
-    CloseOutlet();
-    if ((millis() - actionTimers[Vac_starting_Closing_Outlet]) > maxTimes[Vac_starting_Closing_Outlet])
-    {
-        actions[Vac_starting_Closing_Outlet] = false;
-        CloseVid();
-        Openac();
-        actions[Vac_starting_wait_vacuum] = true;
-        actionTimers[Vac_starting_wait_vacuum] = millis();
-        currentAction = Vac_starting_wait_vacuum;
-    }
-}
-void HandleVacTimeout()
-{
-    // Handle vacuum timeout logic
-    // For now, this function is empty
-}
-void handleVac_starting_wait_vacuum()
-{
-    Hmi_msg = "Vac_starting:wait_vacuum";
-    if (analogRead(I34P_Vacuum) >= 700)
-    {
-        actions[Vac_starting_wait_vacuum] = false;
-        actions[Vac_busy] = true;
-        actionTimers[Vac_busy] = millis();
-        currentAction = Vac_busy;
-    }
-    else if ((millis() - actionTimers[Vac_starting_wait_vacuum]) > maxTimes[Vac_starting_wait_vacuum])
-    {
-        HandleVacTimeout();
-    }
-}
-void handleManual()
-{
-    Hmi_msg = "Manual action asked";
-    actionTimers[Manual] = millis();
-    maxTimes[Vac_busy_Max_Time] = 180000;
-
-    if (Start == 1 && !Vac_starting)
-    {
-        actions[Vac_starting] = true;
-        currentAction = Vac_starting;
-        actionTimers[Vac_starting] = millis();
-        // Ensure that Start is handled properly
-        Start = 0;
-    }
-
-    if ((millis() - actionTimers[Manual]) > maxTimes[Vac_busy_Max_Time])
-    {
-        StopNormal();
-    }
-
-    if ((P_Vacuum <= 200 && actions[Vac_busy]) || L_Tank >= 200)
-    {
-        Man_started = false;
-        StopNormal();
-    }
-
-    if (P_Vacuum <= 300 && !Man_started)
-    {
-        digitalWrite(O17Vid, HIGH);
-        Man_started = true;
-        Hmi_msg = "Manual action started";
-    }
-}
-void handleLess_Grain()
-{
-    Hmi_msg = "Less_Grain";
-    // Code to start Less_Grain
-}
-void handleMore_Grain()
-{
-    Hmi_msg = "More_Grain";
-    // Code to start More_Grain
-}
-void handleSludge()
-{
-    Hmi_msg = "Sludge";
-    // Code to start Sludge
-}
-void handleGRAV()
-{
-    Hmi_msg = "GRAV";
-    // Code to start GRAV
-}
-void StopWrk()
-{
-    // Code to stop work
-}
-
-void checkNewActions()
-{
-    // Check and start new actions if needed
-
-    if (!actions[Vac_starting])
-    {
-        actions[Vac_starting] = true;
-        actionTimers[Vac_starting] = millis();
-    }
-    // Check other conditions and start corresponding actions
-}
-void checkNewTasks()
-{
-    // Check and start new tasks based on input conditions
-
-    // Task: Manual Mode
-    if (Man==1)
-    {
-        currentTask = Manual;
-    }
-
-    // Task: Standby Mode
-    if (Stop == 1)
-    {
-        currentTask = Standby;
-        StopNormal();
-    }
-
-    // Add conditions for other tasks as needed
-}
-// Function to handle task switching
-void handleTasks()
-{
-    switch (currentTask)
-    {
-    case Standby:
-        // Handle Standby logic
-        Hmi_msg = "Standby";
-        break;
-    case Manual:
-        handleManual();
-        break;
-    case Less_Grain:
-        handleLess_Grain();
-        break;
-    case More_Grain:
-        handleMore_Grain();
-        break;
-    case Sludge:
-        handleSludge();
-        break;
-    case Gravel:
-        handleGRAV();
-        break;
-    case Clean:
-        // Handle Clean logic
-        Hmi_msg = "Clean";
-        break;
-    }
-}
-void handleActions()
-{
-    switch (currentAction)
-    {
-    case Vac_stopping:
-        handleVac_stopping();
-        break;
-    case Vac_stopping_Opening_Outlet:
-        handleVac_stopping_Opening_Outlet();
-        break;
-    case Vac_stopping_Emptying_Tank:
-        handleVac_stopping_Emptying_Tank();
-        break;
-    case Vac_stopping_Cleaning_Tank:
-        handleVac_stopping_Cleaning_Tank();
-        break;
-    case Vac_starting:
-        handleVac_starting();
-        break;
-    case Vac_starting_Closing_Outlet:
-        handleVac_starting_Closing_Outlet();
-        break;
-    case Vac_starting_Cleaning_Tank:
-        handleVac_starting_Cleaning_Tank();
-        break;
-    case Vac_starting_wait_vacuum:
-        handleVac_starting_wait_vacuum();
-        break;
-    case Vac_busy:
-        handleVac_busy();
-        break;
-    case Clean_busy:
-        handleClean_busy();
-        break;
-    case None:
-        // Handle None or idle logic if needed
-        Hmi_msg = "None";
-        break;
-    }
-}
-void Handle_Error_not_enough_water()
-{
-    Hmi_msg = "NOT ENOUGH WATER";
-    esp_now_send(slaveAddress, (uint8_t *)Hmi_msg.c_str(), Hmi_msg.length());
-    // Additional logic for handling the error if needed
-}
-void Handle_Error_not_enough_air()
-{
-    Hmi_msg = "NOT ENOUGH AIR";
-    esp_now_send(slaveAddress, (uint8_t *)Hmi_msg.c_str(), Hmi_msg.length());
-    // Additional logic for handling the error if needed
-}
-void setup()
-{
-    // Initialize pins
-    pinMode(I22Start, INPUT);
-    pinMode(I21Man, INPUT);
-    pinMode(I33Stop, INPUT);
-    pinMode(I35P_Water, INPUT);
-    pinMode(I32E_Stop, INPUT);
-    pinMode(I34P_Vacuum, INPUT);
-    pinMode(I39P_Air, INPUT);
-    pinMode(I36L_Tank, INPUT);
-    pinMode(O17Vid, OUTPUT);
-    pinMode(O16Ac, OUTPUT);
-    pinMode(O19Outlet_change_dir, OUTPUT);
-    pinMode(O18Outlet_On_Off, OUTPUT);
-    pinMode(O23Led, OUTPUT);
-    pinMode(O25Clean_e1, OUTPUT);
-    pinMode(O26Clean_sortie, OUTPUT);
-    pinMode(O27Clean_e2, OUTPUT);
-    pinMode(O5Rp, OUTPUT);
-    pinMode(O21Rd, OUTPUT);
-
-    // Initialize serial communication
-    Serial.begin(115200);
-
-    // Initialize ESP-NOW
-    WiFi.mode(WIFI_STA);
-    if (esp_now_init() != ESP_OK)
-    {
-        return;
-    }
-
-    esp_now_register_send_cb(onDataSent);
-    esp_now_register_recv_cb(onDataRecv);
-
-    esp_now_peer_info_t masterInfo = {};
-    memcpy(masterInfo.peer_addr, masterAddress, 6);
-    masterInfo.channel = 0;
-    masterInfo.encrypt = false;
-
-    if (esp_now_add_peer(&masterInfo) != ESP_OK)
-    {
-        return;
-    }
-
-    esp_now_peer_info_t slaveInfo = {};
-    memcpy(slaveInfo.peer_addr, slaveAddress, 6);
-    slaveInfo.channel = 0;
-    slaveInfo.encrypt = false;
-
-    if (esp_now_add_peer(&slaveInfo) != ESP_OK)
-    {
-        return;
-    }
-
-    // attachInterrupt(digitalPinToInterrupt(I33Stop), normalStop, RISING);
-    //attachInterrupt(digitalPinToInterrupt(I32E_Stop), emergencyStop, RISING);
-
-    setStatus(Vac_stopped, true);
-    setStatus(Vid_closed, false);
-    setStatus(Vid_opened, true);
-    setStatus(Ac_closed, true);
-    setStatus(Ac_opened, false);
-    setStatus(Outlet_closed, false);
-    setStatus(Outlet_opened, true);
-    setStatus(Clean_E1_opened, false);
-    setStatus(Clean_E1_closed, true);
-    setStatus(Clean_E2_opened, false);
-    setStatus(Clean_E2_closed, true);
-    setStatus(Clean_sortie_opened, false);
-    setStatus(Clean_sortie_closed, true);
-    setStatus(Led_On, false);
-    setStatus(Led_Off, true);
-    setStatus(Rp_opened, false);
-    setStatus(Rp_closed, true);
-    setStatus(Rd_opened, false);
-    setStatus(Rd_closed, true);
-}
-void loop() {
-    readall();
-
-    checkNewTasks(); // this has priority since through the readall(), it could be that a new task is called, halting eventual actions which are busy.
-    // Check if any new actions need to be started
-    checkNewActions();
-    // Handle actions and tasks based on priority
-    if (actions[Vac_stopping] && (millis() - actionTimers[Vac_stopping] < maxTimes[Vac_stopping])) {
-        // Handle Vac_stopping
-        handleVac_stopping();
-    } else if (actions[Vac_starting] && (millis() - actionTimers[Vac_starting] < maxTimes[Vac_starting])) {
-        // Handle Vac_starting
-        handleVac_starting();
+        Stop_All();
+        Hmi_connected = false;
     } else {
-        // Handle other tasks and actions based on priority
-        if (stopping) {
-            handleVac_stopping();
-        } else if (actions[Vac_starting]) {
-            handleVac_starting();
-        } else {
-            // Handle active tasks (Less_Grain, More_Grain, Sludge, etc.)
-            handleTasks();
-        }
+        Hmi_connected = true;
     }
+    delay(1);
+}
 
+void buildAndSendOutputString() {
+    String OutputString = "||Val_SimOn:" + String(Val_SimOn ? 1 : 0) + "|";
+    OutputString += "Start:" + String(Val_Start) + "|";
+    OutputString += "Man:" + String(Val_Man) + "|";
+    OutputString += "Stop:" + String(Stop) + "|";
+    OutputString += "Estop:" + String(Val_Estop) + "|";
+    OutputString += "Water:" + String(Val_Water) + "|";
+    OutputString += "Vacuum:" + String(Val_Vacuum) + "|";
+    OutputString += "Air:" + String(Val_Air) + "|";
+    OutputString += "L:" + String(Val_Level) + "|";
+    OutputString += "Vid:" + String(digitalRead(O2Vid) ? "OPEN" : "CLOSED") + "|";
+    OutputString += "Ac:" + String(digitalRead(O13Ac) ? "CLOSED" : "OPEN") + "|";
+    OutputString += "Vv_cd:" + String(digitalRead(O19Vv_cd) ? "CLOSING" : "OPENING") + "|";
+    OutputString += "Vv_On_Off:" + String(digitalRead(O18Vv_On_Off) ? "OFF" : "ON") + "|";
+    OutputString += "LED:" + String(digitalRead(O15LED) ? "OFF" : "ON") + "|";
+    OutputString += "Clean_e1_2:" + String(digitalRead(O27Clean_e1_2) ? "CLOSED" : "OPEN") + "|";
+    OutputString += "Rs:" + String(digitalRead(O14Clean_sortie) ? "CLOSED" : "OPEN") + "|";
+    OutputString += "Clean_Ceil:" + String(digitalRead(O5Clean_Ceil) ? "CLOSED" : "OPEN") + "|";
+    OutputString += "Clean_Vv:" + String(digitalRead(O25Clean_Vv) ? "CLOSED" : "OPEN") + "||";
+
+    Serial.println(OutputString);
     sendData();
+}
 
-    if (E_Stop == 0) {
-        StopAll();
-    
-    }
+void read_all() {
+    processRealSensorData();
+    buildAndSendOutputString();
+}
 
-    // Continuous monitoring of I39P_Air and I35P_Water
-if (Stop==1){StopAll();}
-    if (P_Air < 600) {
-        if (airPressureTimer == 0) {
-            airPressureTimer = millis();
-        } else if ((millis() - airPressureTimer) > airTimeout) {
-            Handle_Error_not_enough_air();
-            return;
+void loop() {
+    read_all();
+    // Manual working
+    if (Val_Man != 0) {
+        // start button pressed?
+        if (Val_Start != 0) {
         }
-    } else {
-        airPressureTimer = 0; // Reset the timer if the air pressure is above the threshold
-    }
-
-    if (P_Water < 200) {
-        if (waterPressureTimer == 0) {
-            waterPressureTimer = millis();
-        } else if ((millis() - waterPressureTimer) > waterTimeout) {
-            Handle_Error_not_enough_water();
-            return;
-        }
-    } else {
-        waterPressureTimer = 0; // Reset the timer if the water pressure is above the threshold
     }
 }
