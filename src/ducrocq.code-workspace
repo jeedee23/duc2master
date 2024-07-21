@@ -1,0 +1,15 @@
+{
+	"folders": [
+		{
+			"name": "Ducrocq2",
+			"path": ".."
+		},
+		{
+			"path": "../../ducroc"
+		},
+		{
+			"path": "../../DUCROCQ_SLAVE"
+		}
+	],
+	"settings": {}
+}
